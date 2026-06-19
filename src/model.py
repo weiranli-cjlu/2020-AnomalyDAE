@@ -1,153 +1,86 @@
-from layers import *
-import tensorflow as tf
+from __future__ import annotations
 
-flags = tf.app.flags
-FLAGS = flags.FLAGS
-
-
-class Model(object):
-    def __init__(self, **kwargs):
-        allowed_kwargs = {'name', 'logging'}
-        for kwarg in kwargs.keys():
-            assert kwarg in allowed_kwargs, 'Invalid keyword argument: ' + kwarg
-
-        for kwarg in kwargs.keys():
-            assert kwarg in allowed_kwargs, 'Invalid keyword argument: ' + kwarg
-        name = kwargs.get('name')
-        if not name:
-            name = self.__class__.__name__.lower()
-        self.name = name
-
-        logging = kwargs.get('logging', False)
-        self.logging = logging
-
-        self.vars = {}
-
-    def _build(self):
-        raise NotImplementedError
-
-    def build(self):
-        """ Wrapper for _build() """
-        with tf.variable_scope(self.name):
-            self._build()
-        variables = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope=self.name)
-        self.vars = {var.name: var for var in variables}
-
-    def fit(self):
-        pass
-
-    def predict(self):
-        pass
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.nn import GATConv
 
 
-class GCNModelAE(Model):
-    def __init__(self, placeholders, num_features, features_nonzero, **kwargs):
-        super(GCNModelAE, self).__init__(**kwargs)
+class AnomalyDAE(nn.Module):
+    """Minimal PyG AnomalyDAE.
 
-        self.inputs = placeholders['features']
-        self.input_dim = num_features
-        self.features_nonzero = features_nonzero
-        self.adj = placeholders['adj']
-        self.dropout = placeholders['dropout']
-        self.build()
+    Structure AE:
+        X -> Linear -> GAT -> Z_v -> sigmoid(Z_v Z_v^T)
 
-    def _build(self):
-        self.hidden1 = GraphConvolutionSparse(input_dim=self.input_dim,
-                                              output_dim=FLAGS.hidden1,
-                                              adj=self.adj,
-                                              features_nonzero=self.features_nonzero,
-                                              act=tf.nn.relu,
-                                              dropout=self.dropout,
-                                              logging=self.logging)(self.inputs)
+    Attribute AE:
+        X^T -> Linear -> Linear -> Z_a
+        X_hat = Z_v Z_a^T
+    """
 
-        self.embeddings = GraphConvolution(input_dim=FLAGS.hidden1,
-                                           output_dim=FLAGS.hidden2,
-                                           adj=self.adj,
-                                           act=tf.nn.relu,
-                                           dropout=self.dropout,
-                                           logging=self.logging)(self.hidden1)
-        # self.z_mean = self.embeddings
+    def __init__(
+        self,
+        num_nodes: int,
+        in_dim: int,
+        emb_dim: int = 128,
+        hid_dim: int = 128,
+        dropout: float = 0.0,
+        heads: int = 1,
+        gat_dropout: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.in_dim = in_dim
+        self.emb_dim = emb_dim
+        self.hid_dim = hid_dim
+        self.dropout = dropout
 
-        # decoder1
-        self.attribute_decoder_layer1 = GraphConvolution(input_dim=FLAGS.hidden2,
-                                           output_dim=FLAGS.hidden1,
-                                           adj=self.adj,
-                                           act=tf.nn.relu,
-                                           dropout=self.dropout,
-                                           logging=self.logging)(self.embeddings)
+        if gat_dropout is None:
+            gat_dropout = dropout
 
-        self.attribute_decoder_layer2 = GraphConvolution(input_dim=FLAGS.hidden1,
-                                               output_dim=self.input_dim,
-                                               adj=self.adj,
-                                               act=tf.nn.relu,
-                                               dropout=self.dropout,
-                                               logging=self.logging)(self.attribute_decoder_layer1)
+        self.structure_fc = nn.Linear(in_dim, emb_dim)
+        self.structure_gat = GATConv(
+            emb_dim,
+            hid_dim,
+            heads=heads,
+            concat=False,
+            dropout=gat_dropout,
+            add_self_loops=True,
+        )
 
-        # decoder2
-        self.structure_decoder_layer1 = GraphConvolution(input_dim=FLAGS.hidden2,
-                                           output_dim=FLAGS.hidden1,
-                                           adj=self.adj,
-                                           act=tf.nn.relu,
-                                           dropout=self.dropout,
-                                           logging=self.logging)(self.embeddings)
+        self.attribute_fc1 = nn.Linear(num_nodes, emb_dim)
+        self.attribute_fc2 = nn.Linear(emb_dim, hid_dim)
 
-        self.structure_decoder_layer2 = InnerProductDecoder(input_dim=FLAGS.hidden1,
-                                        act=tf.nn.sigmoid,
-                                        logging=self.logging)(self.structure_decoder_layer1)
+        self.reset_parameters()
 
+    def reset_parameters(self) -> None:
+        nn.init.xavier_uniform_(self.structure_fc.weight)
+        nn.init.zeros_(self.structure_fc.bias)
+        nn.init.xavier_uniform_(self.attribute_fc1.weight)
+        nn.init.zeros_(self.attribute_fc1.bias)
+        nn.init.xavier_uniform_(self.attribute_fc2.weight)
+        nn.init.zeros_(self.attribute_fc2.bias)
+        self.structure_gat.reset_parameters()
 
-        self.attribute_reconstructions = self.attribute_decoder_layer2
-        self.structure_reconstructions = self.structure_decoder_layer2
+    def encode_structure(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+        h = self.structure_fc(x)
+        h = F.relu(h)
+        h = F.dropout(h, p=self.dropout, training=self.training)
+        z_v = self.structure_gat(h, edge_index)
+        return z_v
 
+    def encode_attribute(self, x: torch.Tensor) -> torch.Tensor:
+        # Treat each attribute dimension as an object described by all nodes.
+        z_a = self.attribute_fc1(x.t())
+        z_a = F.relu(z_a)
+        z_a = F.dropout(z_a, p=self.dropout, training=self.training)
+        z_a = self.attribute_fc2(z_a)
+        z_a = F.dropout(z_a, p=self.dropout, training=self.training)
+        return z_a
 
-class AnomalyDAE(Model):
-    def __init__(self, placeholders, num_features, num_nodes, features_nonzero,
-                 decoder_act=[tf.nn.sigmoid, tf.nn.sigmoid], **kwargs):
-        super(AnomalyDAE, self).__init__(**kwargs)
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
+        z_v = self.encode_structure(x, edge_index)
+        z_a = self.encode_attribute(x)
 
-        self.inputs = placeholders['features']
-        self.input_dim = num_features
-        self.features_nonzero = features_nonzero
-        self.n_samples = num_nodes
-        self.adj = placeholders['adj']
-        self.dropout = placeholders['dropout']
-        self.decoder_act = decoder_act
-        self.build()
-
-    def _build(self):
-        self.hidden1 = Dense(input_dim=self.input_dim,
-                             output_dim=FLAGS.hidden1,
-                             act=tf.nn.relu,
-                             sparse_inputs=True,
-                             dropout=self.dropout)(self.inputs)
-
-        self.hidden1 = tf.expand_dims(self.hidden1, 1)
-        attns = []
-        k=1
-        for _ in range(k):
-            attns.append(NodeAttention(bias_mat=self.adj, nb_nodes=self.n_samples,
-                                       # act=tf.nn.relu,
-                                       act=lambda x: x,
-                                       out_sz=FLAGS.hidden2//k)(self.hidden1))
-
-        self.embeddings_s = tf.concat(attns, axis=-1)[0]
-
-        self.hidden2 = Dense(input_dim=self.n_samples,
-                             output_dim=FLAGS.hidden1,
-                             act=tf.nn.relu,
-                             sparse_inputs=True,
-                             dropout=self.dropout)(tf.sparse_transpose(self.inputs))
-
-        self.embeddings_a = Dense(input_dim=FLAGS.hidden1,
-                              output_dim=FLAGS.hidden2,
-                              act=lambda x: x,
-                              # act=tf.nn.relu,
-                              dropout=self.dropout)(self.hidden2)
-        print("FLAGS.hidden2,",FLAGS.hidden2)
-
-        self.structure_reconstructions, self.attribute_reconstructions\
-            = InnerDecoder(input_dim=FLAGS.hidden2,
-                                            act=self.decoder_act,
-                                            logging=self.logging)((self.embeddings_s, self.embeddings_a))
-
-
+        adj_hat = torch.sigmoid(z_v @ z_v.t())
+        x_hat = z_v @ z_a.t()
+        return x_hat, adj_hat, z_v, z_a
