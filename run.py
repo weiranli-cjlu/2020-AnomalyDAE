@@ -1,21 +1,30 @@
 from __future__ import annotations
 
-import os
 import argparse
+import csv
+import os
+from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 import numpy as np
 
 from src.data import load_mat_data
 from src.train import train_full_batch
-from src.utils import PRESETS, evaluate_scores, save_outputs, set_seed, topk_indices
+from src.utils import PRESETS, evaluate_scores, set_seed
 
 
 def build_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="AnomalyDAE PyG minimal reproduction")
-    parser.add_argument("--dataset", type=str, default="Disney")
+    parser = argparse.ArgumentParser(description="AnomalyDAE PyG multi-trial evaluation")
+    parser.add_argument("--dataset", type=str, default="Disney", help="Dataset name, or comma-separated names such as ACM,Flickr")
     parser.add_argument("--data_dir", type=str, default="~/datasets/GAD/mat")
-    parser.add_argument("--preset", type=str, default=None, choices=[None, "blogcatalog", "flickr", "acm"], help="Use paper-like hyper-parameters")
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default=None,
+        choices=[None, "blogcatalog", "flickr", "acm"],
+        help="Use paper-like hyper-parameters",
+    )
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--emb_dim", type=int, default=128)
     parser.add_argument("--hid_dim", type=int, default=128)
@@ -27,14 +36,15 @@ def build_args() -> argparse.Namespace:
     parser.add_argument("--lr", type=float, default=0.001)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--log_every", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=42, help="Base seed; trial i uses seed + i")
+    parser.add_argument("--trials", type=int, default=1, help="Number of repeated trials")
     parser.add_argument("--feature_normalize", type=str, default="none", choices=["none", "row", "standard"])
     parser.add_argument("--directed", action="store_true", help="Do not symmetrize edges")
     parser.add_argument("--compile", action="store_true", help="Use torch.compile")
-    parser.add_argument("--output_dir", type=str, default="outputs")
-    parser.add_argument("--topk", type=int, default=None)
-    parser.add_argument("--contamination", type=float, default=0.1)
+    parser.add_argument("--result_csv", type=str, default="outputs/results.csv", help="CSV path for summarized results")
+    parser.add_argument("--overwrite", action="store_true", help="Overwrite result_csv instead of appending")
+    parser.add_argument("--verbose", action="store_true", help="Print trial progress and enable training progress bar")
+    parser.add_argument("--dis_tqdm", action="store_true", help="Disable training progress bar")
     return parser.parse_args()
 
 
@@ -46,57 +56,106 @@ def apply_preset(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
-def main() -> None:
-    args = apply_preset(build_args())
-    set_seed(args.seed)
+def parse_datasets(dataset_arg: str) -> list[str]:
+    datasets = [item.strip() for item in dataset_arg.split(",") if item.strip()]
+    if not datasets:
+        raise ValueError("--dataset cannot be empty")
+    return datasets
+
+
+def format_metric(values: Iterable[float]) -> str:
+    arr = np.asarray(list(values), dtype=float) * 100.0
+    if arr.size == 0:
+        raise ValueError("metric values cannot be empty")
+    return f"{arr.mean():.2f}±{arr.std():.2f}({arr.max():.2f})"
+
+
+def append_summary_row(csv_path: str | Path, row: dict[str, str], overwrite: bool = False) -> None:
+    csv_path = Path(csv_path)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    file_exists = csv_path.exists() and csv_path.stat().st_size > 0
+    mode = "w" if overwrite else "a"
+    write_header = overwrite or not file_exists
+
+    with csv_path.open(mode, newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=["datetime", "dataset", "trial", "auc", "auprc"])
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def evaluate_one_dataset(args: argparse.Namespace, dataset: str) -> dict[str, str]:
+    data_path = os.path.join(os.path.expanduser(args.data_dir), dataset + ".mat")
     data = load_mat_data(
-        os.path.join(os.path.expanduser(args.data_dir), args.dataset+".mat"),
+        data_path,
         make_undirected=not args.directed,
         feature_normalize=None if args.feature_normalize == "none" else args.feature_normalize,
     )
 
-    print(f"Dataset: {args.dataset}")
-    print(f"Nodes={data.num_nodes}, Edges={data.edge_index.size(1)}, Features={data.x.size(1)}")
-    print(f"Feature key={getattr(data, 'feat_key', None)}, Adj key={getattr(data, 'adj_key', None)}")
-    if hasattr(data, "y"):
-        print(f"Label key={getattr(data, 'label_key', None)}, Anomalies={int(data.y.sum())}")
+    if not hasattr(data, "y"):
+        raise ValueError(f"Dataset {dataset} has no label field; cannot compute AUC/AUPRC.")
 
-    result = train_full_batch(
-        data=data,
-        emb_dim=args.emb_dim,
-        hid_dim=args.hid_dim,
-        heads=args.heads,
-        dropout=args.dropout,
-        alpha=args.alpha,
-        eta=args.eta,
-        theta=args.theta,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        epochs=args.epochs,
-        device=args.device,
-        log_every=args.log_every,
-        compile_model=args.compile,
-    )
+    auc_values: list[float] = []
+    auprc_values: list[float] = []
 
-    scores = result.scores.numpy()
-    print(f"Final loss: {result.final_loss:.6f}")
+    for trial in range(args.trials):
+        trial_seed = args.seed + trial
+        set_seed(trial_seed)
+        result = train_full_batch(
+            data=data,
+            emb_dim=args.emb_dim,
+            hid_dim=args.hid_dim,
+            heads=args.heads,
+            dropout=args.dropout,
+            alpha=args.alpha,
+            eta=args.eta,
+            theta=args.theta,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            epochs=args.epochs,
+            device=args.device,
+            log_every=0,
+            compile_model=args.compile,
+            show_progress=args.verbose,
+            tqdm=not args.dis_tqdm,
+        )
+        metrics = evaluate_scores(data.y.cpu().numpy(), result.scores.numpy())
+        if "auroc" not in metrics or "auprc" not in metrics:
+            raise ValueError(f"Dataset {dataset} labels contain only one class; cannot compute AUC/AUPRC.")
+        auc_values.append(metrics["auroc"])
+        auprc_values.append(metrics["auprc"])
+        if args.verbose:
+            print(
+                f"{dataset} trial {trial + 1}/{args.trials}: "
+                f"auc={metrics['auroc'] * 100:.2f}, auprc={metrics['auprc'] * 100:.2f}"
+            )
 
-    if hasattr(data, "y"):
-        metrics = evaluate_scores(data.y.cpu().numpy(), scores)
-        if metrics:
-            print(f"AUROC: {metrics['auroc']:.4f}")
-            print(f"AUPRC: {metrics['auprc']:.4f}")
-        else:
-            print("Labels contain only one class; AUROC/AUPRC skipped.")
+    return {
+        "datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "dataset": dataset,
+        "trial": str(args.trials),
+        "auc": format_metric(auc_values),
+        "auprc": format_metric(auprc_values),
+    }
 
-    top_idx = topk_indices(scores, k=args.topk, contamination=args.contamination)
-    print("Top anomaly node ids:", top_idx[:20].tolist())
 
-    save_outputs(scores, args.output_dir)
-    np.save(Path(args.output_dir) / "structure_scores.npy", result.struct_scores.numpy())
-    np.save(Path(args.output_dir) / "attribute_scores.npy", result.attr_scores.numpy())
-    np.save(Path(args.output_dir) / "embedding.npy", result.embedding.numpy())
-    print(f"Saved outputs to: {args.output_dir}")
+def main() -> None:
+    args = apply_preset(build_args())
+    if args.trials <= 0:
+        raise ValueError("--trials must be a positive integer")
+
+    rows: list[dict[str, str]] = []
+    for idx, dataset in enumerate(parse_datasets(args.dataset)):
+        row = evaluate_one_dataset(args, dataset)
+        append_summary_row(args.result_csv, row, overwrite=args.overwrite and idx == 0)
+        rows.append(row)
+
+    for row in rows:
+        print(
+            f"{row['datetime']},{row['dataset']},{row['trial']},"
+            f"{row['auc']},{row['auprc']}"
+        )
+    print(f"Saved results to: {args.result_csv}")
 
 
 if __name__ == "__main__":

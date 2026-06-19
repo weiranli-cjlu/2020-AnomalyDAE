@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 import torch
 from torch_geometric.utils import to_dense_adj
-from tqdm import trange
 
 from .loss import anomalydae_loss
 from .model import AnomalyDAE
+
+try:
+    from tqdm import trange
+except ImportError:  # pragma: no cover
+    trange = None
 
 
 @dataclass
@@ -35,13 +38,10 @@ def train_full_batch(
     device: str = "cpu",
     log_every: int = 10,
     compile_model: bool = False,
+    show_progress: bool = True,
+    tqdm: bool = True
 ) -> TrainResult:
-    """Train AnomalyDAE in full-batch mode.
-
-    AnomalyDAE reconstructs a dense adjacency matrix, so full-batch training is
-    faithful to the paper but has O(N^2) memory cost. For very large graphs,
-    use a sampled/minibatch variant instead.
-    """
+    """Train AnomalyDAE in full-batch mode."""
     device_obj = torch.device(device if torch.cuda.is_available() or device == "cpu" else "cpu")
     data = data.to(device_obj)
     x = data.x.float()
@@ -61,19 +61,22 @@ def train_full_batch(
         dropout=dropout,
         heads=heads,
     ).to(device_obj)
-
     if compile_model:
         model = torch.compile(model)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     final_loss = 0.0
 
-    iterator = trange(epochs, desc="Training", leave=True)
+    if tqdm and trange is not None:
+        iterator = trange(epochs, desc="Training", leave=True)
+    else:
+        iterator = range(epochs)
+
     for epoch in iterator:
         model.train()
         optimizer.zero_grad(set_to_none=True)
         x_hat, adj_hat, _, _ = model(x, edge_index)
-        loss, scores, _, _ = anomalydae_loss(
+        loss, _, _, _ = anomalydae_loss(
             x=x,
             x_hat=x_hat,
             adj=adj,
@@ -86,8 +89,9 @@ def train_full_batch(
         optimizer.step()
         final_loss = float(loss.detach().cpu())
 
-        if log_every > 0 and ((epoch + 1) % log_every == 0 or epoch == 0):
-            iterator.set_postfix(loss=f"{final_loss:.6f}")
+        if show_progress and log_every > 0 and ((epoch + 1) % log_every == 0 or epoch == 0):
+            if hasattr(iterator, "set_postfix"):
+                iterator.set_postfix(loss=f"{final_loss:.6f}")
 
     model.eval()
     with torch.no_grad():
